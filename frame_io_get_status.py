@@ -25,11 +25,11 @@ Updates:
 import xml.etree.ElementTree as ET
 import flame
 import os
-import requests
-from frameioclient import FrameioClient
+import traceback # For catch_exception
+from frameioclient import FrameioClient, errors as frameio_errors
 
 SCRIPT_NAME = 'FrameIO Get Status'
-SCRIPT_PATH = '/opt/Autodesk/shared/python/frame_io'
+SCRIPT_PATH = os.path.abspath(os.path.dirname(__file__)) # Updated SCRIPT_PATH
 VERSION = 'v0.2'
 
 #-------------------------------------#
@@ -38,107 +38,144 @@ VERSION = 'v0.2'
 class frame_io_get_status(object):
 
     def __init__(self, selection):
-
-        print('\n')
-        print('>' * 10, f'{SCRIPT_NAME} {VERSION}', ' Start ', '<' * 10, '\n')
-
-        # Paths
+        print(f'\n{">" * 10} {SCRIPT_NAME} {VERSION} Start {"<" * 10}\n')
 
         self.config_path = os.path.join(SCRIPT_PATH, 'config')
         self.config_xml = os.path.join(self.config_path, 'config.xml')
 
-        # Load config file
+        if not self.config():
+            print(f"{SCRIPT_NAME} {VERSION}: Configuration failed. Exiting.")
+            return
 
-        self.config()
+        try:
+            self.client = FrameioClient(self.token)
+        except Exception as e:
+            flame.messages.show_in_dialog(f"{SCRIPT_NAME} Error", f"Failed to initialize Frame.io client: {e}", type="error")
+            print(f"Error initializing Frame.io client: {e}")
+            traceback.print_exc()
+            return
 
-        # Start Script Here
-        self.get_comments(selection)
+        # Start Script Here - Call renamed method
+        self.sync_frameio_statuses_to_flame(selection)
+
+    def catch_exception(method):
+        def wrapper(self, *args, **kwargs):
+            try:
+                return method(self, *args, **kwargs)
+            except frameio_errors.APIError as e:
+                error_message = f"Frame.io API Error in {method.__name__}:\n{e}\nURL: {e.response.url if e.response else 'N/A'}\nStatus: {e.response.status_code if e.response else 'N/A'}"
+                print(error_message)
+                traceback.print_exc()
+                flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Frame.io API Error", error_message, type="error")
+            except Exception as e:
+                error_message = f"An unexpected error occurred in {method.__name__}:\n{e}"
+                print(error_message)
+                traceback.print_exc()
+                flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Unexpected Error", error_message, type="error")
+        return wrapper
 
     def config(self):
-
+        """Loads or creates the configuration file.
+        Returns True if successful, False otherwise."""
         def get_config_values():
+            try:
+                xml_tree = ET.parse(self.config_xml)
+            except FileNotFoundError:
+                flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Config Error", f"Config file not found: {self.config_xml}", type="error")
+                return False
+            except ET.ParseError:
+                flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Config Error", f"Error parsing config file: {self.config_xml}. Check its XML format.", type="error")
+                return False
 
-            xml_tree = ET.parse(self.config_xml)
             root = xml_tree.getroot()
 
-            # Get Settings from config XML
+            root = xml_tree.getroot()
+            settings_el = root.find('frame_io_settings')
+            if settings_el is None:
+                flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Config Error", f"Invalid config format: <frame_io_settings> tag not found in {self.config_xml}", type="error")
+                return False
 
-            for setting in root.iter('frame_io_settings'):
-                self.token = setting.find('token').text
-                self.account_id = setting.find('account_id').text
-                self.team_id = setting.find('team_id').text
-                self.jobs_folder = setting.find('jobs_folder').text
-                self.preset_path_h264 = setting.find('preset_path_h264').text
+            self.token = settings_el.findtext('token')
+            self.account_id = settings_el.findtext('account_id')
+            self.team_id = settings_el.findtext('team_id')
+            self.jobs_folder = settings_el.findtext('jobs_folder') # Kept for consistency
+            self.preset_path_h264 = settings_el.findtext('preset_path_h264') # Kept for consistency
 
+            if not all([self.token, self.account_id, self.team_id]):
+                flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Config Error", "Token, Account ID, or Team ID is missing from the config file.", type="error")
+                return False
 
-            # pyflame_print(SCRIPT_NAME, 'Config loaded.')
+            if 'fio-x-xxxxxx' in self.token:
+                 flame.messages.show_in_dialog(f"{SCRIPT_NAME}: Config Warning", f"The token in {self.config_xml} appears to be a placeholder. Please update it with your actual Frame.io API token.", type="warning")
+
+            print(f"{SCRIPT_NAME}: Config loaded successfully.")
+            return True
 
         def create_config_file():
-
             if not os.path.isdir(self.config_path):
                 try:
-                    os.makedirs(self.config_path)
-                except:
+                    os.makedirs(self.config_path, exist_ok=True)
+                    print(f"Config directory created: {self.config_path}")
+                except OSError as e:
                     flame.messages.show_in_dialog(
-                        title = "f'{SCRIPT_NAME}: Error",
-                        message = f'Unable to create folder: {self.config_path}<br>Check folder permissions',
-                        type = "error",
-                        buttons = ["Ok"],
-                        cancel_button = "Cancel")
-                    # FlameMessageWindow('error', f'{SCRIPT_NAME}: Error', f'Unable to create folder: {self.config_path}<br>Check folder permissions')
+                        title=f"{SCRIPT_NAME}: Directory Creation Error",
+                        message=f"Unable to create config folder: {self.config_path}\nError: {e}\nCheck folder permissions.",
+                        type="error")
+                    return False
 
             if not os.path.isfile(self.config_xml):
-                # pyflame_print(SCRIPT_NAME, 'Config file does not exist. Creating new config file.')
-
-                config = '''
-<settings>
+                print(f"{SCRIPT_NAME}: Config file does not exist. Creating new config file: {self.config_xml}")
+                default_preset_path = os.path.join(SCRIPT_PATH, "presets", "UC H264 10Mbits.xml")
+                config_content = f"""<settings>
     <frame_io_settings>
         <token>fio-x-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-xxxxxxxxxxx-xxxxxxxxxxx</token>
         <account_id>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</account_id>
         <team_id>xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx</team_id>
         <jobs_folder>/Volumes/vfx/UC_Jobs</jobs_folder>
-        <preset_path_h264>/opt/Autodesk/shared/python/frame_io/presets/UC H264 10Mbits.xml</preset_path_h264>
+        <preset_path_h264>{default_preset_path}</preset_path_h264>
     </frame_io_settings>
-</settings>'''
+</settings>
+"""
+                try:
+                    with open(self.config_xml, 'w') as config_file:
+                        config_file.write(config_content.strip())
+                    print(f"Default config file created: {self.config_xml}")
+                    flame.messages.show_in_dialog(
+                        title=f"{SCRIPT_NAME}: Config File Created",
+                        message=f"A new config file was created at:\n{self.config_xml}\nPlease update it with your Frame.io credentials and verify paths.",
+                        type="info")
+                    return True
+                except IOError as e:
+                    flame.messages.show_in_dialog(
+                        title=f"{SCRIPT_NAME}: File Creation Error",
+                        message=f"Unable to create config file: {self.config_xml}\nError: {e}\nCheck file permissions.",
+                        type="error")
+                    return False
+            return True
 
-                with open(self.config_xml, 'a') as config_file:
-                    config_file.write(config)
-                    config_file.close()
+        if not os.path.isfile(self.config_xml):
+            if not create_config_file():
+                return False
 
-        if os.path.isfile(self.config_xml):
-            get_config_values()
-        else:
-            create_config_file()
-            if os.path.isfile(self.config_xml):
-                get_config_values()
+        return get_config_values()
 
-    def get_comments(self, selection):
-        print("Starting FrameIO stuff...")
+    @catch_exception
+    def sync_frameio_statuses_to_flame(self, selection): # Renamed method
+        print(f"{SCRIPT_NAME}: Starting to sync Frame.io statuses...")
        
         self.project_nickname = flame.projects.current_project.nickname
-        # Initialize the client library
-        # client = FrameioClient(self.token)
-        self.headers = {
-        "Content-Type": "application/json",
-        "Authorization": "Bearer " + str(self.token)
-        }
-        # print("headers: ", self.headers)
-        print("Project Nickname: ", self.project_nickname)
-        try:
-            root_asset_id, project_id = self.get_fio_projects()
-        except:
-            message = ("Can't find " + self.project_nickname + " FrameIO Project.")
-            flame.messages.show_in_dialog(
-            title = "Error",
-            message = message,
-            type = "error",
-            buttons = ["Ok"])
-            print (message)
-            return
+        # self.client is initialized in __init__
+        # self.headers is removed
 
-        # print('root_asset_id: ', root_asset_id)
-        # print('project_id: ', project_id)
-        self.root_asset_id = root_asset_id
+        print(f"Current Flame project nickname: {self.project_nickname}")
+
+        project_info = self.get_fio_projects()
+        if not project_info:
+            print(f"Aborting status sync as Frame.io project '{self.project_nickname}' could not be accessed.")
+            return # Error dialog should be shown by get_fio_projects
+
+        _root_asset_id, project_id = project_info # Use _ for unused root_asset_id
+        print(f"Using Frame.io project ID: {project_id}")
 
         for item in selection:
             selection_name = item.name
@@ -170,83 +207,56 @@ class frame_io_get_status(object):
                         item.colour = (0.26274511218070984, 0.40784314274787903, 0.5019607543945312)
                 else:
                     message = f"{selection_name} has no status in FrameIO." 
-                    flame.messages.show_in_console(message, 'info',3)
+                    message = f"Asset '{selection_name}' found but has no status (label) in Frame.io."
+                    flame.messages.show_in_dialog(f"{SCRIPT_NAME} Info", message, type="info")
+                    print(message)
 
-            else:
-                message = "Can't find " + selection_name + " in FrameIO."
-                flame.messages.show_in_console(message, 'info',6)
-                continue
+            else: # Asset not found
+                message = f"Asset '{selection_name}' not found in Frame.io project '{self.project_nickname}'."
+                flame.messages.show_in_console(message, 'info', 6)
+                # No dialog for "not found" to avoid too many popups if many items aren't on Frame.io
+                print(message)
+                continue # Next item
 
-        print('>' * 10, f'{SCRIPT_NAME} {VERSION}', ' End ', '<' * 10, '\n')
+        print(f'\n{">" * 10} {SCRIPT_NAME} {VERSION} End {"<" * 10}\n')
 
-
+    @catch_exception
     def get_fio_projects(self):
-        # Get FrameIO Project ID using the Flame Project Name
-        url = "https://api.frame.io/v2/teams/" + self.team_id + "/projects"
-        query = {
-        "filter[archived]": "none",
-        "include_deleted": "false"
-        }
-        response = requests.get(url, headers=self.headers, params=query)
-        data = response.json()
+        """Gets a Frame.io project by nickname. Returns (root_asset_id, project_id) or None."""
+        print(f"Searching for Frame.io project: {self.project_nickname} in team {self.team_id}")
+        projects_iterator = self.client.teams.list_projects(team_id=self.team_id)
+        for project in projects_iterator:
+            if project['name'] == self.project_nickname and not project.get('is_archived') and not project.get('deleted_at'):
+                print(f"Found project: {project['name']} (ID: {project['id']})")
+                return project['root_asset_id'], project['id']
 
-        for projects in data:
-            if projects['_type'] == "project" and projects['name'] == self.project_nickname:
-                # print(projects['name'], "id: ", projects['id'])
-                root_asset_id = projects['root_asset_id']
-                # print("root_asset_id: ", root_asset_id)
-                project_id = projects['id']
-                # print("project_id: ", project_id)
-                return (root_asset_id, project_id)
-       
-    def find_a_fio_asset(self, project_id,base_name):
-        url = "https://api.frame.io/v2/search/assets"
+        print(f"Project '{self.project_nickname}' not found.")
+        # Show dialog here as this is a prerequisite for the script's main function
+        flame.messages.show_in_dialog(f"{SCRIPT_NAME} Error", f"Frame.io project named '{self.project_nickname}' not found in team ID '{self.team_id}'.", type="error")
+        return None
 
-        query = {
-            "account_id": self.account_id,
-            # "include": "user_role",
-            # "include_deleted": "true",
-            # "page": "0",
-            # "page_size": "0",
-            "project_id": project_id,
-            "q": base_name,
-            # "query": "string",
-            # "shared_projects": "true",
-            # "sort": "string",
-            "team_id": self.team_id
-        }
-        # print(query)
-        response = requests.get(url, headers=self.headers, params=query)
+    @catch_exception
+    def find_a_fio_asset(self, project_id: str, base_name: str):
+        """
+        Finds an asset by base_name in a project.
+        Returns a dictionary with 'id' and 'label' or None if not found or error.
+        """
+        print(f"Searching for asset with name '{base_name}' in project ID: {project_id}")
+        search_results = self.client.search.library(
+            query=base_name,
+            project_id=project_id,
+            team_id=self.team_id, # May not be strictly necessary if project_id is global
+            account_id=self.account_id
+        )
 
-        data = response.json()
-        # print(data)
-        type = []
-        id = []
-        status = []
-        for item in data:
-            # print(item[('name'))
-            type = item['type']
-            # print(item['type'])
-            id = item['id']
-            # print(item['id'])
-            status = item['label']
-            # print(item['label'])
-            break
-        return(type,id,status)
+        for asset_item in search_results:
+            # Exact name match is preferred for status checking
+            if asset_item['name'] == base_name and asset_item['type'] in ['file', 'version_stack', 'folder']: # Folders can also have labels
+                print(f"Found asset: {asset_item['name']} (ID: {asset_item['id']}, Label: {asset_item.get('label')})")
+                return {'id': asset_item['id'], 'label': asset_item.get('label')} # Return dict with id and label
 
-    def get_selection_comments(self, id):
-
-        url = "https://api.frame.io/v2/assets/" + id + "/comments"
-
-        query = {
-        "include": "replies"
-        }
-
-        response = requests.get(url, headers=self.headers, params=query)
-
-        data = response.json()
-        # print(data)
-        return(data)
+        print(f"No asset with exact name '{base_name}' found in project {project_id}.")
+        return None
 
 # Scope
 def scope_clip(selection):
