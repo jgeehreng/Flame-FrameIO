@@ -39,6 +39,8 @@ Script Version: 1.2 (7.11.22 JS-B)
 '''
 
 # ------------- IMPORTS------------------#
+import ast
+import os
 import flame
 import csv
 from flame import PyTime
@@ -47,14 +49,34 @@ from os.path import expanduser
 # ------------- MAIN SCRIPT------------------#
     
 def remove_quotes(string):
-    #removes the quotes from the ends of a string
-    # '""a""' turns into 'a'
-    if string[0] == "\'" and string[-1] == "\'":
+    """Remove matching quotes from the ends of a string."""
+    if not string:
+        return ""
+
+    string = string.strip()
+    if len(string) >= 2 and string[0] == "'" and string[-1] == "'":
         return remove_quotes(string[1:-1])
-    elif string[0] == "\"" and string[-1] == "\"":
+    if len(string) >= 2 and string[0] == '"' and string[-1] == '"':
         return remove_quotes(string[1:-1])
-    else:
-        return string
+    return string
+
+
+def _resolve_csv_path():
+    """Return the CSV path selected in the Flame browser."""
+    selection = getattr(flame.browser, "selection", None)
+
+    if isinstance(selection, str):
+        try:
+            parsed = ast.literal_eval(selection)
+            if isinstance(parsed, (list, tuple)) and parsed:
+                selection = parsed[0]
+        except Exception:
+            selection = selection.strip("[]'\" ")
+
+    if isinstance(selection, (list, tuple)):
+        selection = selection[0] if selection else ""
+
+    return expanduser(selection) if selection else ""
 
 def add_markers(selection):
    
@@ -68,17 +90,40 @@ def add_markers(selection):
         multi_selection = False,
         extension = "csv",
         default_path = default_path)
-    csv_path = (str(flame.browser.selection)[2:-2])
-    
-    if csv_path:
-        print ("CSV Selection: ", csv_path, '\n')
-        pass
-    else:
+    csv_path = _resolve_csv_path()
+
+    if not csv_path:
         return
-    
+
+    if not os.path.isfile(csv_path):
+        flame.messages.show_in_console(f"CSV file not found: {csv_path}", "warning", 5)
+        return
+
     # Requrited Header names of the column containing Timecodes and Comments
     tc_header = 'Timecode Source In'
     comment_header = 'Comment'
+
+    try:
+        with open(csv_path, mode='r', newline='') as file:
+            csv_reader = csv.DictReader(file)
+            fieldnames = csv_reader.fieldnames or []
+            if tc_header not in fieldnames or comment_header not in fieldnames:
+                message = "'Timecode Source In' and/or 'Comment' header not found in CSV file."
+                print(message)
+                flame.messages.show_in_console(message, "warning", 5)
+                return
+
+            rows = [
+                row for row in csv_reader
+                if (row.get(tc_header) and row.get(comment_header))
+            ]
+    except Exception as exc:
+        flame.messages.show_in_console(f"Failed to read CSV: {exc}", "warning", 5)
+        return
+
+    if not rows:
+        flame.messages.show_in_console("No usable marker rows found in CSV.", "info", 5)
+        return
     
     for flame_obj in selection:
         if isinstance(flame_obj, (flame.PyClip, flame.PySequence, flame.PySegment)):
@@ -91,35 +136,30 @@ def add_markers(selection):
                 continue
 
         if isinstance(flame_obj, (flame.PyClip, flame.PySequence, flame.PySegment)):
-            with open(csv_path, mode='r') as file:
-                csv_reader = csv.DictReader(file)
-                if tc_header not in csv_reader.fieldnames or comment_header not in csv_reader.fieldnames:
-                    print("'Timecode Source In' and/or 'Comment' header not found in CSV file.")
-                    flame.messages.show_in_console("'Timecode Source In' and/or 'Comment' header not found in CSV file.", "warning", 5)
-                    return
-                
-                for row in csv_reader:
-                    if row[tc_header] and row[comment_header]:
-                        timecode =  row[tc_header]
-                        # print("Time Code:",timecode)
-                        comment = remove_quotes(row[comment_header])
-                        # print("Comment:", comment)
-                        duration =  row['Duration']
-                        # print("Duration:", duration)
-                        commenter = remove_quotes(row['Commenter'])
-                        # print("Comment by:", commenter)
-                        marker_time = PyTime(timecode,frame_rate)
-                        
-                        # Create Markers
-                        try:
-                            m = flame_obj.create_marker(marker_time)
-                            m.colour = (0.2, 0.0, 0.0)
-                            if duration != '0':
-                                m.duration = int(duration)
-                            m.comment = comment
-                            m.name = f"Commenter: {commenter}" 
-                        except:
-                            pass
+            for row in rows:
+                timecode = row.get(tc_header, "").strip()
+                comment = remove_quotes(row.get(comment_header, ""))
+                duration_raw = row.get('Duration') or '0'
+                commenter = remove_quotes(row.get('Commenter') or 'Unknown')
+
+                try:
+                    marker_time = PyTime(timecode, frame_rate)
+                except Exception:
+                    continue
+
+                try:
+                    m = flame_obj.create_marker(marker_time)
+                    m.colour = (0.2, 0.0, 0.0)
+                    try:
+                        duration_frames = int(float(duration_raw))
+                    except (ValueError, TypeError):
+                        duration_frames = 0
+                    if duration_frames > 0:
+                        m.duration = duration_frames
+                    m.comment = comment
+                    m.name = f"Commenter: {commenter}" 
+                except Exception:
+                    continue
 
 # ----------- SCOPES ------------------#
                 
