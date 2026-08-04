@@ -8,12 +8,12 @@ Sets the status of any items in FrameIO based on the color label(s) of the Flame
 
 import flame
 import traceback
+from pathlib import Path
 from lib.frame_io_api import (
     validate_config,
     get_fio_projects,
     find_fio_asset,
     set_asset_status,
-    map_flame_label_to_status,
 )
 
 
@@ -67,21 +67,25 @@ def frame_io_set_status(selection):
         for item in selection:
             selection_name = str(item.name)[1:-1]
             selection_color_label = item.colour_label
-
-            new_label = map_flame_label_to_status(selection_color_label)
-            if not new_label:
-                message = (
-                    f"{selection_name} does not have a Color Label that matches the FrameIO Status options."
-                )
+            
+            # Map color label to FrameIO status
+            if selection_color_label == "Approved":
+                new_label = "approved"
+            elif selection_color_label == "Needs Review":
+                new_label = "needs_review"
+            elif selection_color_label == "In Progress":
+                new_label = "in_progress"
+            else:
+                message = f"{selection_name} does not have a Color Label that matches the FrameIO Status options."
                 flame.messages.show_in_console(message, "info", 3)
                 continue
 
             # find an asset using project and selection name
             search = find_fio_asset(cfg, project_id, selection_name)
-            if search != (None, None, None):
-                asset_type, asset_id, parent_id = search
+            if search != (None, None, None, None):
+                asset_type, asset_id, parent_id, file_id = search
                 try:
-                    set_asset_status(cfg, asset_id, new_label)
+                    set_asset_status(cfg, project_id, file_id, new_label)
                     log(f"Successfully updated the label of asset {selection_name} to '{new_label}'.")
                 except Exception as e:
                     log(f"Failed to update label: {e}")

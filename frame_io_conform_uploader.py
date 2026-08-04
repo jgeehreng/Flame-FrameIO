@@ -1,11 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FrameIO Conform Uploader v1.3.0 — Uppercut VFX Pipeline
+FrameIO Conform Uploader v1.4.0 — Uppercut VFX Pipeline
 - export selection into FROM_FLAME/date/time
 - write files to /Volumes/.../FROM_FLAME/date  (no double time)
 - upload to FrameIO
 - auto-version-up in Flame before export
+v1.3.1 - collapse FROM_FLAME shared library and all child folders before release_exclusive_access
+v1.3.2 - fix double CONFORMS folder: capture folder id on new-project creation so the
+         subsequent find-or-create step is skipped (Frame.io search index is eventually
+         consistent and previously returned no results for the just-created folder)
+v1.4.0 - migrate to Frame.io V4 API: replace frameioclient SDK upload with the
+         local_upload + presigned-S3-PUT flow, and version_asset/resolve_stack_root_id
+         with add_version()
 """
 
 import os
@@ -14,7 +21,7 @@ import datetime
 import re
 import traceback
 from PySide6 import QtWidgets, QtCore
-from frameioclient import FrameioClient
+from pathlib import Path
 from lib.frame_io_api import (
     validate_config,
     get_fio_projects,
@@ -22,14 +29,13 @@ from lib.frame_io_api import (
     find_fio_asset,
     find_fio_folder,
     create_fio_folder,
-    version_asset,
-    resolve_stack_root_id,
+    add_version,
+    upload_file,
 )
-from lib.frame_io_ui import FrameIOProgressDialog
 
 
 SCRIPT_NAME = "FrameIO Conform Uploader"
-VERSION = "v1.3.0"
+VERSION = "v1.4.0"
 
 # ----------------------------------------------------------
 # Toast
@@ -63,6 +69,50 @@ def attr(x):
         return x
 
 # ----------------------------------------------------------
+# Progress UI
+# ----------------------------------------------------------
+class FrameIOProgressDialog(QtWidgets.QDialog):
+    def __init__(self, total_files, title="FrameIO Upload Progress"):
+        super().__init__()
+        self.setWindowTitle(title)
+        self.setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
+        self.resize(420, 150)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.status_label = QtWidgets.QLabel("Preparing uploads…")
+        self.file_progress = QtWidgets.QProgressBar()
+        self.file_progress.setRange(0, 100)
+        self.total_progress = QtWidgets.QProgressBar()
+        self.total_progress.setRange(0, max(1, total_files))
+
+        layout.addWidget(self.status_label)
+        layout.addWidget(QtWidgets.QLabel("Current File"))
+        layout.addWidget(self.file_progress)
+        layout.addWidget(QtWidgets.QLabel("Overall"))
+        layout.addWidget(self.total_progress)
+
+    def update_total_file(self, idx, total, filename):
+        self.total_progress.setMaximum(max(1, total))
+        self.total_progress.setValue(max(0, idx - 1))
+        self.file_progress.setValue(0)
+        self.status_label.setText(f"Uploading {os.path.basename(filename)} ({idx}/{total})…")
+        QtWidgets.QApplication.processEvents()
+
+    def update_file_percent(self, percent, message=None):
+        clamped = max(0, min(100, int(percent)))
+        self.file_progress.setValue(clamped)
+        if message:
+            self.status_label.setText(message)
+        QtWidgets.QApplication.processEvents()
+
+    def finish(self, message="Upload complete", delay_ms=1500):
+        self.total_progress.setValue(self.total_progress.maximum())
+        self.file_progress.setValue(100)
+        self.status_label.setText(message)
+        QtWidgets.QApplication.processEvents()
+        QtCore.QTimer.singleShot(delay_ms, self.accept)
+
+# ----------------------------------------------------------
 # Shared Library Helpers
 # ----------------------------------------------------------
 def get_or_create_shared_library(name="FROM_FLAME"):
@@ -82,6 +132,16 @@ def ensure_folder(parent, name):
     if hasattr(parent, "create_folder"):
         return parent.create_folder(name)
     raise RuntimeError("Flame version does not expose create_folder().")
+
+def collapse_recursive(node):
+    """Collapse *node* and every descendant folder in the media panel."""
+    try:
+        for child in getattr(node, "folders", []):
+            collapse_recursive(child)
+        if hasattr(node, "expanded"):
+            node.expanded = False
+    except Exception as e:
+        log(f"WARNING: Could not collapse node '{getattr(node, 'name', node)}': {e}")
 
 # ----------------------------------------------------------
 # Auto version-up (exact name search style)
@@ -106,22 +166,26 @@ def auto_version_up_flame(selection, cfg, project_id):
             clip_name = raw_name.strip()
             log(f"[auto_version_up_flame] Checking '{clip_name}'")
 
-            # Find version token in the name
-            m = re.search(r"([vV])(\d+)", clip_name)
-            if not m:
+            # Find version token in the name — use the LAST match so names
+            # with an earlier incidental "v##"-looking substring (e.g. a shot
+            # or product code) don't get mistaken for the version token.
+            matches = list(re.finditer(r"([vV])(\d+)", clip_name))
+            if not matches:
                 log(f"WARNING: {clip_name} needs a version number like 'v01'.")
                 continue
+            m = matches[-1]
 
             # Derive a base name by stripping the version portion
             base_name = clip_name[:m.start()].rstrip(" _-")
             version_prefix = m.group(1)
             current_version = int(m.group(2))
+            padding = len(m.group(2))
 
             # If we somehow ended up with an empty base_name, fall back to full clip_name
             search_name = base_name or clip_name
 
             # Use the same search strategy that the uploader uses (base name search)
-            asset_type, asset_id, parent_id = find_fio_asset(cfg, project_id, search_name)
+            asset_type, asset_id, parent_id, file_id = find_fio_asset(cfg, project_id, search_name)
 
             if asset_type is None:
                 # Per-item message instead of a for-else that fires once at the end
@@ -131,13 +195,13 @@ def auto_version_up_flame(selection, cfg, project_id):
                 )
                 continue
 
-            # Bump the version number in the string
+            # Bump the version number in the string (preserving zero-padding),
+            # replacing only the last version token found above.
             new_version = current_version + 1
-            new_name = re.sub(
-                r"[vV]\d+",
-                f"{version_prefix}{new_version:02d}",
-                clip_name,
-                count=1,
+            new_name = (
+                clip_name[:m.start()]
+                + f"{version_prefix}{new_version:0{padding}d}"
+                + clip_name[m.end():]
             )
 
             try:
@@ -204,6 +268,7 @@ def export_and_collect(selection, project_token, jobs_folder, cfg):
 
         return os.path.join(posting_folder, time_name)
     finally:
+        collapse_recursive(lib)
         lib.release_exclusive_access()
 
 # ----------------------------------------------------------
@@ -242,24 +307,25 @@ def start_upload(selection):
         had_errors = False
 
         # Get or create FrameIO project
+        conforms_folder_id = None
         try:
             root_asset_id, project_id = get_fio_projects(cfg, project_token)
         except Exception:
             root_asset_id, project_id = create_fio_project(cfg, project_token)
-            # Create default folders
+            # Create default folders and capture the CONFORMS id so we don't
+            # search for it below — the Frame.io search index is eventually
+            # consistent and may not reflect the folder immediately, which
+            # previously caused a second CONFORMS folder to be created.
             create_fio_folder(cfg, root_asset_id, "SHOTS")
-            create_fio_folder(cfg, root_asset_id, "CONFORMS")
-
-        token = cfg.get("frame_io_token") or cfg.get("token")
-        client = FrameioClient(token)
-
-        # Find or create CONFORMS folder
-        conforms_folder_id = None
-        search = find_fio_folder(cfg, project_id, "CONFORMS")
-        if search != (None, None, None):
-            _, conforms_folder_id, _ = search
-        else:
             conforms_folder_id = create_fio_folder(cfg, root_asset_id, "CONFORMS")
+
+        # Find or create CONFORMS folder (skipped when we just created it above)
+        if conforms_folder_id is None:
+            search = find_fio_folder(cfg, project_id, "CONFORMS")
+            if search != (None, None, None, None):
+                _, conforms_folder_id, _, _ = search
+            else:
+                conforms_folder_id = create_fio_folder(cfg, root_asset_id, "CONFORMS")
 
         log(f"files: {files}")
         completed = False
@@ -287,20 +353,24 @@ def start_upload(selection):
                     5, f"Preparing upload for {file_name} ({idx}/{len(files)})…"
                 )
 
+                def _on_progress(uploaded, total, _idx=idx, _len=len(files), _name=file_name):
+                    pct = 5 + int((uploaded / total) * 90) if total else 5
+                    progress_dialog.update_file_percent(
+                        pct, f"Uploading {_name} ({_idx}/{_len})…"
+                    )
+
                 # find an asset using project and base name
                 search = find_fio_asset(cfg, project_id, base_name)
-                if search != (None, None, None):
-                    asset_type, asset_id, parent_id = search
-                    if asset_type == "file":
-                        log(f"Search results for matching base name asset ID: {asset_id}")
+                if search != (None, None, None, None):
+                    asset_type, asset_id, parent_id, existing_file_id = search
+                    if asset_type in ("file", "version_stack"):
+                        log(f"Search results for matching base name asset ID: {asset_id} ({asset_type})")
                         try:
-                            # Upload to the parent folder
-                            asset = client.assets.upload(parent_id, filename)
-                            next_asset_id = str(asset["id"])
-                            # Try to version it (stack it with the existing asset)
+                            # Upload into the parent folder, then stack/move it
+                            # alongside the existing file/version_stack.
+                            new_file_id = upload_file(cfg, parent_id, filename, progress_callback=_on_progress)
                             try:
-                                root_id = resolve_stack_root_id(cfg, asset_id)
-                                version_asset(cfg, root_id, next_asset_id)
+                                add_version(cfg, asset_type, asset_id, new_file_id, parent_id)
                                 log(f"Successfully versioned {file_name} with existing asset")
                             except Exception as version_error:
                                 # Versioning failed, but upload succeeded
@@ -314,7 +384,7 @@ def start_upload(selection):
                             log(f"WARNING: Upload to parent folder failed: {e}")
                             log(f"   Attempting fallback upload to CONFORMS folder...")
                             try:
-                                asset = client.assets.upload(conforms_folder_id, filename)
+                                upload_file(cfg, conforms_folder_id, filename, progress_callback=_on_progress)
                                 log(f"Fallback upload to CONFORMS succeeded")
                             except Exception as inner:
                                 log(f"WARNING:  Fallback upload also failed: {inner}")
@@ -322,11 +392,10 @@ def start_upload(selection):
                                     0, f"WARNING: Failed to upload {file_name}. Continuing…"
                                 )
                                 continue
-
-                    elif asset_type == "version_stack":
-                        log(f"Version Stack ID: {asset_id}")
+                    else:
+                        log("Can't find a match...uploading to the CONFORMS folder.")
                         try:
-                            asset = client.assets.upload(asset_id, filename)
+                            upload_file(cfg, conforms_folder_id, filename, progress_callback=_on_progress)
                         except Exception as e:
                             had_errors = True
                             log(f"Upload failed: {e}")
@@ -337,7 +406,7 @@ def start_upload(selection):
                 else:
                     log("Can't find a match...uploading to the CONFORMS folder.")
                     try:
-                        asset = client.assets.upload(conforms_folder_id, filename)
+                        upload_file(cfg, conforms_folder_id, filename, progress_callback=_on_progress)
                     except Exception as e:
                         had_errors = True
                         log(f"Upload failed: {e}")

@@ -7,12 +7,12 @@ Fetches the status of any items in FrameIO and color codes the Flame selection.
 
 import flame
 import traceback
+from pathlib import Path
 from lib.frame_io_api import (
     validate_config,
     get_fio_projects,
     find_fio_asset,
     get_asset_status,
-    map_status_to_flame,
 )
 
 SCRIPT_NAME = "FrameIO Get Status"
@@ -36,20 +36,23 @@ def show_message(text, title=SCRIPT_NAME):
     except Exception:
         print(f"[{SCRIPT_NAME}] {text}")
 
-def apply_colour(obj, status):
-    """Apply Flame label/colour mapping for a FrameIO status."""
-    mapping = map_status_to_flame(status)
-    if not mapping:
-        return False
-
-    label = mapping["label"]
-    colour = mapping["colour"]
-
+def safe_colour_label(obj, status):
+    """Apply color label based on status, with RGB fallback."""
     try:
-        obj.colour_label = label
+        if status == "approved":
+            obj.colour_label = "Approved"
+        elif status == "needs_review":
+            obj.colour_label = "Needs Review"
+        elif status == "in_progress":
+            obj.colour_label = "In Progress"
     except Exception:
-        obj.colour = colour
-    return True
+        # RGB fallbacks
+        if status == "approved":
+            obj.colour = (0.11372549086809158, 0.26274511218070984, 0.1764705926179886)
+        elif status == "needs_review":
+            obj.colour = (0.6000000238418579, 0.3450980484485626, 0.16470588743686676)
+        elif status == "in_progress":
+            obj.colour = (0.26274511218070984, 0.40784314274787903, 0.5019607543945312)
 
 # ----------------------------------------------------------
 # Main
@@ -90,18 +93,18 @@ def frame_io_get_status(selection):
 
             # log(f"DEBUG: find_fio_asset returned: {search}")
 
-            if search == (None, None, None):
+            if search == (None, None, None, None):
                 msg = f"NOT FOUND in FrameIO: {selection_name}"
                 log(msg)
                 show_message(msg)
                 flame.messages.show_in_console(msg, "info", 6)
                 continue
 
-            asset_type, asset_id, parent_id = search
+            asset_type, asset_id, parent_id, file_id = search
 
             # --------- Step 2: Fetch Status ----------
             try:
-                status = get_asset_status(cfg, asset_id)
+                status = get_asset_status(cfg, file_id)
             except Exception as e:
                 log(f"ERROR: get_asset_status crashed: {e}")
                 show_message(f"get_asset_status ERROR:\n{e}")
@@ -111,8 +114,12 @@ def frame_io_get_status(selection):
             # show_message(f"Status for {selection_name}:\n{status}")
 
             # --------- Step 3: Apply Color ----------
-            if apply_colour(item, status):
-                log(f"Applied color label for {selection_name}: {status}")
+            if status in ("approved", "needs_review", "in_progress"):
+                try:
+                    safe_colour_label(item, status)
+                    log(f"Applied color label for {selection_name}: {status}")
+                except Exception as e:
+                    log(f"ERROR: applying color: {e}")
             else:
                 msg = f"{selection_name}: No mappable status ({status})"
                 flame.messages.show_in_console(msg, "info", 3)

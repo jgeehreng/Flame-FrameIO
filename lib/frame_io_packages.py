@@ -5,7 +5,6 @@ Flame Launch hook: installs required Python packages for FrameIO integration.
 Prompts for administrator password via GUI dialog (falls back to terminal if GUI unavailable).
 Targets Flame's versioned site-packages.
 Installs if missing:
-  - frameioclient (import name: frameioclient)
   - requests (import name: requests)
 """
 
@@ -27,7 +26,6 @@ except ImportError:
 # Static requirements: (import_name, pip_distribution)
 REQUIRED_PACKAGES: List[Tuple[str, str]] = [
     ("requests", "requests"),
-    ("frameioclient", "frameioclient"),
 ]
 
 
@@ -199,7 +197,6 @@ def _install_missing_with_sudo(missing: List[Tuple[str, str]]) -> None:
         "--disable-pip-version-check",
     ]
     if flame_site_packages:
-        os.makedirs(flame_site_packages, exist_ok=True)
         pip_args += ["--target", flame_site_packages]
 
     # Deduplicate

@@ -2,6 +2,10 @@
 
 A comprehensive integration suite for connecting Autodesk Flame with FrameIO, enabling seamless uploads, comment synchronization, and project management within the Uppercut VFX Pipeline.
 
+> **V4 API**: This integration talks to Frame.io's V4 API (`https://api.frame.io/v4`) using
+> plain `requests` calls (no SDK). See [Authentication](#authentication) below for details on
+> the custom header this account requires.
+
 ## Overview
 
 This package provides several Python scripts that integrate FrameIO's review and collaboration platform with Autodesk Flame. The integration supports:
@@ -12,6 +16,7 @@ This package provides several Python scripts that integrate FrameIO's review and
 - **Comment Synchronization**: Fetch comments from FrameIO and create Flame markers
 - **Status Management**: Get and set FrameIO status labels on Flame clips
 - **Automatic Versioning**: Smart version increment based on existing FrameIO assets
+- **Share Links**: Generate a client-ready public share link for selected clips/segments, exporting/uploading anything not already in FrameIO
 
 ## Requirements
 
@@ -20,15 +25,16 @@ This package provides several Python scripts that integrate FrameIO's review and
 - **FrameIO Token** (get one from [FrameIO Developer Portal](https://developer.frame.io/))
 - **Required Python packages** (automatically installed via `frame_io_packages.py`):
   - `requests`
-  - `frameioclient` (FrameIO Python SDK)
 
 ## Installation
 
-1. **Copy the files** to your Flame Python scripts directory:
+1. **Copy the files** to your Flame Python scripts directory. The scripts resolve all of
+   their own paths relative to their own location, so any of the standard Flame script
+   locations work — e.g. for a shared, studio-wide install:
    ```
    /opt/Autodesk/shared/python/frame_io/
    ```
-   Or for user-specific installation:
+   Or for a user-specific installation:
    ```
    ~/flame/python/frame_io/
    ```
@@ -37,10 +43,10 @@ This package provides several Python scripts that integrate FrameIO's review and
    ```
    frame_io/
    ├── lib/
-   │   ├── __init__.py
-   │   └── frame_io_api.py
+   │   ├── frame_io_api.py
+   │   └── frame_io_packages.py
    ├── config/
-   │   └── shared_config.json
+   │   └── shared_config.json  (created on first run via the Config Editor)
    ├── presets/
    │   └── (export presets)
    ├── frame_io_config_editor.py
@@ -52,7 +58,27 @@ This package provides several Python scripts that integrate FrameIO's review and
    └── frame_io_csv_to_markers.py
    ```
 
-3. **First-time setup**: Launch Flame and use the config editor to set up your FrameIO token, account ID, and team ID.
+3. **First-time setup**: Launch Flame and use the config editor to set up your FrameIO token (and Client ID, if your account requires it — see [Authentication](#authentication)), account ID, and workspace ID.
+
+## Authentication
+
+This integration authenticates with the Frame.io V4 API using a **legacy developer token**
+(`fio-u-...`) as a Bearer credential — there is no OAuth flow, token exchange, or SDK involved.
+
+For most Frame.io accounts, that's all you need. However, accounts that are managed through
+the **Adobe Admin Console** reject legacy developer tokens for *account-scoped* V4 endpoints
+(projects, workspaces, folders, metadata, etc.) by default, even though the token still works
+for `/v4/me`. If your account is in this situation, Frame.io/Adobe support can provision a
+scoped **"service client" `client_id`**. When set, every request adds an
+`x-frameio-service-client: <client_id>` header alongside the Bearer token, which unlocks
+account-scoped calls without needing OAuth Server-to-Server credentials.
+
+Config keys involved:
+- `frame_io_token`: your legacy developer token (`fio-u-...`)
+- `client_id`: the service-client id from Frame.io/Adobe support (leave blank if not needed)
+
+Use the **Validate Token** button in the Config Editor to check both `/v4/me` and
+account-scoped access — it will tell you if a Client ID is required.
 
 ## Configuration
 
@@ -70,17 +96,22 @@ Global settings are stored at:
 - `debug`: Enable verbose debug logging (default: `false`)
 - `enable_file_logging`: Enable file logging to `~/flame/python/frame_io/logs/` (default: `false`)
 
-### User Configuration
+Additional keys in the same file:
+- `frame_io_token`: The FrameIO API token used by everyone on the pipeline (required)
+- `client_id`: Service-client id for Adobe Admin Console-managed accounts (optional — see [Authentication](#authentication))
+- `frame_io_account_id`: The FrameIO account ID (required)
+- `frame_io_workspace_id`: The FrameIO workspace ID (required; `frame_io_team_id` is still accepted as a legacy alias)
 
-User-specific settings are stored at:
-```
-~/flame/python/frame_io/user_config.json
-```
-
-**User Settings:**
-- `frame_io_token`: Your FrameIO API token (required)
-- `frame_io_account_id`: Your FrameIO account ID (required)
-- `frame_io_team_id`: Your FrameIO team ID (required)
+This account uses one shared service-client credential for the whole studio rather than
+per-artist tokens, so there is no separate per-user config file — everything lives in
+`shared_config.json`. If an artist still has a leftover `~/flame/python/frame_io/user_config.json`
+(or old `~/flame/python/frame_io/config.xml`) from the V2 per-user-token days, its
+`frame_io_token`/`client_id`/`frame_io_account_id`/`frame_io_workspace_id`/`frame_io_team_id`
+values are **always ignored** — only `shared_config.json` can supply those — to prevent a
+stale personal account/token from silently shadowing the shared one (this caused "Unable to
+find project" / 401 / 404 errors for some artists after the V4 migration). Any other, non-auth
+keys in that file are still merged in for backward compatibility, and a console warning is
+logged if the file is found so it can be deleted. The Config Editor no longer reads or writes it.
 
 ### Config Editor
 
@@ -89,10 +120,9 @@ Access the configuration editor from Flame's main menu:
 Main Menu → UC FrameIO → Edit Config
 ```
 
-The editor provides:
-- **Global Settings Tab**: Configure shared pipeline settings
-- **User Settings Tab**: Configure your personal FrameIO token, account ID, and team
-- **Token Validation**: Test your FrameIO token and auto-populate account/team info
+A single-form dialog for editing `shared_config.json`:
+- FrameIO Token, Client ID, Account ID, and Workspace (with "Validate Token" auto-populating account/workspace)
+- Jobs Folder, H.264 Preset Path, Project Token mode, Debug Mode, File Logging
 - **Documentation Links**: Quick access to FrameIO API documentation
 
 ## Scripts
@@ -101,9 +131,9 @@ The editor provides:
 
 **Location**: Main Menu → UC FrameIO → Edit Config
 
-A GUI tool for managing both global and user-specific FrameIO configuration. Features:
-- Separate tabs for global and user settings
-- Token validation with account/team auto-discovery
+A single-form GUI tool for managing the shared FrameIO configuration. Features:
+- One flat form for both auth (token/client ID/account/workspace) and pipeline settings
+- Token validation with account/workspace auto-discovery
 - Real-time configuration updates
 - Support for both project nickname and name token modes
 
@@ -162,7 +192,7 @@ Fetches comments from FrameIO and creates Flame markers:
 
 **Location**: Media Panel → UC FrameIO → Get Status
 
-Fetches status labels from FrameIO and applies color coding:
+Fetches status from FrameIO and applies color coding:
 - Maps FrameIO statuses to Flame color labels:
   - `approved` → "Approved" (green)
   - `needs_review` → "Needs Review" (orange)
@@ -177,7 +207,7 @@ Fetches status labels from FrameIO and applies color coding:
 
 **Location**: Media Panel → UC FrameIO → Set Status
 
-Sets FrameIO status labels based on Flame color labels:
+Sets FrameIO status based on Flame color labels:
 - Maps Flame color labels to FrameIO statuses:
   - "Approved" → `approved`
   - "Needs Review" → `needs_review`
@@ -189,7 +219,41 @@ Sets FrameIO status labels based on Flame color labels:
 3. Right-click → UC FrameIO → Set Status
 4. FrameIO status is updated to match Flame color labels
 
-### 7. CSV to Markers (`frame_io_csv_to_markers.py`)
+> **V4 note**: Frame.io V4 has no built-in "label"/status field like V2 did. Status get/set
+> instead reads and writes a custom account-level **Metadata** field named `Status` (type
+> `select`) with options `Needs Review`, `In Progress`, and `Approved`. This field must already
+> exist on the account (Account Settings → Metadata) — the scripts look it up dynamically by
+> name and cache the field/option ids, they do not create it for you.
+
+### 7. FrameIO Create Share Link (`frame_io_create_share.py`)
+
+**Location**:
+- Media Panel → UC FrameIO → Create Share Link
+- Timeline → UC FrameIO → Create Share Link
+
+Creates a single public FrameIO share link covering the selected clips/segments:
+- Items already uploaded to FrameIO are matched by name and added to the share directly.
+- Items not yet in FrameIO are exported (H264) and uploaded first (same export/upload path
+  as the Conform/Shot Uploaders), then added.
+- Multiple selected items are combined into **one** share link.
+- The resulting link defaults to: public access, downloading enabled, no expiration,
+  commenting enabled (Frame.io's default for asset shares — not independently configurable
+  via the API).
+- The URL is shown in a dialog and copied to the clipboard.
+
+**Usage:**
+1. Select one or more clips/segments in Media Panel or Timeline
+2. Right-click → UC FrameIO → Create Share Link
+3. Missing items are exported and uploaded automatically
+4. The share URL is shown in a dialog and copied to your clipboard
+
+> **Note on guest identity**: anyone with a public share link can comment without a FrameIO
+> account. Per Frame.io, their name is **not** exposed via the API (see Get Comments' console
+> notes for "Unknown" authors) — only visible in the browser share page itself. If you need
+> comment attribution to work reliably for client feedback, invite reviewers to a **secure**
+> share by name/email instead of relying on the open public link.
+
+### 8. CSV to Markers (`frame_io_csv_to_markers.py`)
 
 **Location**: 
 - Media Panel → UC FrameIO → CSV → Timeline Markers
@@ -215,6 +279,10 @@ Both uploader scripts support automatic version increment:
 - Searches FrameIO for existing assets with matching base name
 - If found, automatically increments version number (e.g., `v01` → `v02`)
 - Works with both lowercase (`v01`) and uppercase (`V01`) version patterns
+- Under the hood, uploads use V4's local-upload flow (create a placeholder file, then `PUT` the
+  bytes to one or more presigned S3 URLs) and versioning either moves the new file into an
+  existing version stack or creates a new stack from the two files — there's no third-party
+  SDK involved.
 
 ### Comment Caching
 
@@ -254,7 +322,8 @@ The system maintains backward compatibility with XML config files:
 
 ### Config Issues
 
-- **Missing token/account/team**: Use the Config Editor (Main Menu → UC FrameIO → Edit Config) to set up your credentials
+- **Missing token/account/workspace**: Use the Config Editor (Main Menu → UC FrameIO → Edit Config) to set up your credentials
+- **403 "This account does not allow legacy developer tokens"**: Your account is Adobe Admin Console-managed — get a Client ID from Frame.io/Adobe support and add it in the Config Editor (see [Authentication](#authentication))
 - **Invalid token**: Use the "Validate Token" button in the Config Editor to test your token
 - **Configuration errors**: Check error messages for specific missing fields and use the Config Editor to fix them
 
@@ -263,7 +332,7 @@ The system maintains backward compatibility with XML config files:
 - **Export preset not found**: Check that `preset_path_h264` in config points to a valid preset file
 - **Upload fails**: Verify your FrameIO token has proper permissions for the project
 - **Network errors**: The system will automatically retry failed uploads. Check logs for detailed error information
-- **Permission denied**: Ensure your FrameIO token has permission to create projects and upload files in the specified team
+- **Permission denied**: Ensure your FrameIO token has permission to create projects and upload files in the specified workspace
 
 ### Comment Issues
 

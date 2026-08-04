@@ -5,13 +5,15 @@
 
 import flame
 import math
+import requests
 # import re
 # import os
 from lib.frame_io_api import (
     validate_config,
     get_fio_projects,
     find_fio_asset,
-    get_asset_comments
+    get_asset_comments,
+    get_comment_owner,
 )
 
 SCRIPT_NAME = 'FrameIO Get Comments'
@@ -162,8 +164,27 @@ class frame_io_get_comments(object):
             or owner.get("name")
             or owner.get("email")
         )
+        if name:
+            return name
 
-        return name or "Unknown"
+        # 4) V4 quirk: nested `replies` come back with no owner/user/creator
+        # field at all (Frame.io's schema only embeds `owner` on the
+        # top-level comment, not on replies). Fall back to a per-reply
+        # lookup via the single "show comment" endpoint, which does return
+        # an owner. Cache by comment id to avoid repeat lookups.
+        comment_id = info.get("id")
+        if comment_id:
+            cache_key = f"comment:{comment_id}"
+            if cache_key in author_cache:
+                return author_cache[cache_key]
+
+            fetched_owner = get_comment_owner(self.cfg, comment_id) or {}
+            name = fetched_owner.get("name") or fetched_owner.get("email")
+            if name:
+                author_cache[cache_key] = name
+                return name
+
+        return "Unknown"
 
 
     # ----------------------
@@ -195,12 +216,8 @@ class frame_io_get_comments(object):
             if base_name in comment_cache:
                 comments = comment_cache[base_name]
             else:
-                _, asset_id, _ = find_fio_asset(self.cfg, self.project_id, base_name)
-                if not asset_id:
-                    log(f"No FrameIO asset found for '{base_name}'")
-                    comment_cache[base_name] = []
-                    continue
-                comments = get_asset_comments(self.cfg, asset_id)
+                _, _, _, file_id = find_fio_asset(self.cfg, self.project_id, base_name)
+                comments = get_asset_comments(self.cfg, file_id) if file_id else []
                 comment_cache[base_name] = comments
 
             if not comments:
@@ -213,23 +230,28 @@ class frame_io_get_comments(object):
             author_cache = {}
 
             for info in comments:
-                # Only top-level comments make markers
-                if info.get("parent_id"):
-                    continue
-
+                # V4's list endpoint only returns top-level comments; replies
+                # are nested under each comment's "replies" array (fetched via
+                # include=replies), so there's no parent_id to filter on here.
                 base_text = (info.get('text') or '').strip()
                 if not base_text:
                     continue
 
                 # Author for top-level comment
                 author = self.resolve_author(info, author_cache)
+                if author == "Unknown":
+                    log(
+                        f"NOTE: Could not resolve author for a comment on '{base_name}' — "
+                        "likely a public-share/anonymous commenter, which Frame.io V4 "
+                        "does not expose via the API (not a bug)."
+                    )
 
-                # FrameIO base frame
-                raw_frame = info.get('frame', 0)
+                # FrameIO base frame (V4 "timestamp" is already an integer framestamp)
+                raw_frame = info.get('timestamp', 0)
                 try:
-                    base_frame = int(str(raw_frame)[0:-2])
-                except Exception:
                     base_frame = int(raw_frame) if raw_frame else 0
+                except Exception:
+                    base_frame = 0
 
                 # Replies
                 replies = info.get('replies') or []
@@ -244,10 +266,12 @@ class frame_io_get_comments(object):
                         continue
 
                     r_author = self.resolve_author(r, author_cache)
-
-                    # # If reply has no identity, fall back to a generic label
-                    # if r_author == "Unknown":
-                    #     r_author = "Reply"
+                    if r_author == "Unknown":
+                        log(
+                            f"NOTE: Could not resolve reply author for a reply on '{base_name}' — "
+                            "likely a public-share/anonymous commenter, which Frame.io V4 "
+                            "does not expose via the API (not a bug)."
+                        )
 
                     reply_pairs.append((r_author, r_text))
 
@@ -265,6 +289,11 @@ class frame_io_get_comments(object):
 
                 # Marker creation
                 target = item if is_segment else sequence_obj
+
+                # Avoid duplicate markers at the same frame on repeated runs
+                if any(getattr(m, "frame", None) == base_frame for m in getattr(target, "markers", [])):
+                    continue
+
                 try:
                     marker = target.create_marker(int(base_frame))
                 except Exception:

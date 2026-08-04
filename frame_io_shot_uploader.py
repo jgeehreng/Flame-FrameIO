@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FrameIO Shot Uploader v1.3.0 — Uppercut VFX Pipeline
+FrameIO Shot Uploader v1.4.0 — Uppercut VFX Pipeline
 Exports h264 .mp4 files to a FROM_FLAME folder and uploads them to FrameIO.
 Automatically creates or adds to version stacks using the <shot>_<task> base name.
+v1.4.0 - migrate to Frame.io V4 API: replace frameioclient SDK upload with the
+         local_upload + presigned-S3-PUT flow, and version_asset/resolve_stack_root_id
+         with add_version()
 """
 
+from pathlib import Path
 import os
 import flame
 import datetime
 import re
 import traceback
 import glob
-from PySide6 import QtWidgets
-from frameioclient import FrameioClient
+from PySide6 import QtWidgets, QtCore
 
 from lib.frame_io_api import (
     validate_config,
@@ -22,14 +25,13 @@ from lib.frame_io_api import (
     find_fio_asset,
     find_fio_folder,
     create_fio_folder,
-    version_asset,
-    resolve_stack_root_id,
+    add_version,
+    upload_file,
     log_error,
 )
-from lib.frame_io_ui import FrameIOProgressDialog
 
 SCRIPT_NAME = "FrameIO Shot Uploader"
-VERSION = "v1.3.0"
+VERSION = "v1.4.0"
 
 
 # ----------------------------------------------------------
@@ -49,6 +51,52 @@ def show_message(text, title=SCRIPT_NAME):
             QtWidgets.QMessageBox.information(None, title, text)
     except Exception:
         print(f"[{SCRIPT_NAME}] {text}")
+
+
+# ----------------------------------------------------------
+# Progress Dialog
+# ----------------------------------------------------------
+
+class FrameIOProgressDialog(QtWidgets.QDialog):
+    def __init__(self, total_files, title="FrameIO Upload Progress"):
+        super().__init__()
+        self.setWindowTitle(title)
+        self.setWindowFlags(QtCore.Qt.WindowStaysOnTopHint)
+        self.resize(420, 150)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self.status_label = QtWidgets.QLabel("Preparing uploads…")
+        self.file_progress = QtWidgets.QProgressBar()
+        self.file_progress.setRange(0, 100)
+        self.total_progress = QtWidgets.QProgressBar()
+        self.total_progress.setRange(0, max(1, total_files))
+
+        layout.addWidget(self.status_label)
+        layout.addWidget(QtWidgets.QLabel("Current File"))
+        layout.addWidget(self.file_progress)
+        layout.addWidget(QtWidgets.QLabel("Overall"))
+        layout.addWidget(self.total_progress)
+
+    def update_total_file(self, idx, total, filename):
+        self.total_progress.setMaximum(max(1, total))
+        self.total_progress.setValue(max(0, idx - 1))
+        self.file_progress.setValue(0)
+        self.status_label.setText(f"Uploading {os.path.basename(filename)} ({idx}/{total})…")
+        QtWidgets.QApplication.processEvents()
+
+    def update_file_percent(self, percent, message=None):
+        clamped = max(0, min(100, int(percent)))
+        self.file_progress.setValue(clamped)
+        if message:
+            self.status_label.setText(message)
+        QtWidgets.QApplication.processEvents()
+
+    def finish(self, message="Upload complete", delay_ms=1500):
+        self.total_progress.setValue(self.total_progress.maximum())
+        self.file_progress.setValue(100)
+        self.status_label.setText(message)
+        QtWidgets.QApplication.processEvents()
+        QtCore.QTimer.singleShot(delay_ms, self.accept)
 
 
 # ----------------------------------------------------------
@@ -149,14 +197,11 @@ def upload_to_frameio(export_dir, cfg):
         create_fio_folder(cfg, root_asset_id, "CONFORMS")
         create_fio_folder(cfg, root_asset_id, "SHOTS")
 
-    token = cfg.get("frame_io_token") or cfg.get("token")
-    client = FrameioClient(token)
-
     # Find or create SHOTS folder
     shots_folder_id = None
     search = find_fio_folder(cfg, project_id, "SHOTS")
-    if search != (None, None, None):
-        _, shots_folder_id, _ = search
+    if search != (None, None, None, None):
+        _, shots_folder_id, _, _ = search
     else:
         shots_folder_id = create_fio_folder(cfg, root_asset_id, "SHOTS")
 
@@ -188,21 +233,24 @@ def upload_to_frameio(export_dir, cfg):
             base_name = extract_base_name(file_name)
             log(f"Base name for search: {base_name}")
 
+            def _on_progress(uploaded, total, _name=file_name):
+                pct = 5 + int((uploaded / total) * 90) if total else 5
+                progress_dialog.update_file_percent(pct, f"Uploading {_name}…")
+
             # Try to find an existing asset with this base name
             search = find_fio_asset(cfg, project_id, base_name)
 
-            if search != (None, None, None):
-                asset_type, asset_id, parent_id = search
+            if search != (None, None, None, None):
+                asset_type, asset_id, parent_id, existing_file_id = search
 
-                # --- Case: Existing file — upload then version it ---
-                if asset_type == "file":
+                # --- Case: Existing file or version stack — upload into the
+                #     parent folder, then stack/move it alongside the match ---
+                if asset_type in ("file", "version_stack"):
                     try:
-                        uploaded = client.assets.upload(parent_id, filename)
-                        new_asset_id = str(uploaded["id"])
+                        new_file_id = upload_file(cfg, parent_id, filename, progress_callback=_on_progress)
 
                         try:
-                            root_id = resolve_stack_root_id(cfg, asset_id)
-                            version_asset(cfg, root_id, new_asset_id)
+                            add_version(cfg, asset_type, asset_id, new_file_id, parent_id)
                             log(f"Versioned {file_name} with asset {asset_id}")
                         except Exception as ve:
                             had_errors = True
@@ -213,20 +261,21 @@ def upload_to_frameio(export_dir, cfg):
                         log_error(f"Failed to upload {file_name}: {e}", exc_info=True)
                         continue
 
-                # --- Case: Version stack — upload directly into it ---
-                elif asset_type == "version_stack":
+                # --- Case: Matched a folder — upload to SHOTS folder ---
+                else:
+                    log(f"Matched a non-file asset. Uploading {file_name} to SHOTS.")
                     try:
-                        client.assets.upload(asset_id, filename)
+                        upload_file(cfg, shots_folder_id, filename, progress_callback=_on_progress)
                     except Exception as e:
                         had_errors = True
-                        log_error(f"Failed to upload {file_name}: {e}", exc_info=True)
+                        log_error(f"Upload failed for {file_name}: {e}", exc_info=True)
                         continue
 
             # --- Case: No match — upload to SHOTS folder ---
             else:
                 log(f"No match found. Uploading {file_name} to SHOTS.")
                 try:
-                    client.assets.upload(shots_folder_id, filename)
+                    upload_file(cfg, shots_folder_id, filename, progress_callback=_on_progress)
                 except Exception as e:
                     had_errors = True
                     log_error(f"Upload failed for {file_name}: {e}", exc_info=True)
@@ -295,3 +344,4 @@ def get_media_panel_custom_ui_actions():
             ]
         }
     ]
+
